@@ -43,7 +43,7 @@ jobs:
       env:
         # 将 USERS_JSON 配置在 GitHub Repository Secrets 中
         # 格式: [{"username": "xxx", "password": "xxx"}, ...]
-        USERS_JSON: ${{ secrets.USERS_JSON }}
+        USERS_JSON: ${{ secrets.rawJson }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
