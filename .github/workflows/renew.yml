@@ -12,7 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - name: 📥 1. 下载公开库 (获取 package.json)
+      uses: actions/checkout@v4
+
+    - name: 📥 2. 下载私库 (获取 action.js)
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/Renew-Private # 替换为你的私库名
+        token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        path: private_temp
+
+    - name: 📂 3. 移动脚本到根目录
+      run: |
+        mv private_temp/katabump_renew.py ./katabump_renew.py
+        # 如果私库还有其他依赖文件，请在这里一并 mv 过来
     
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -35,7 +48,7 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       # 使用 xvfb-run 模拟有头环境运行
-      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
+      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.py
 
     - name: Upload Screenshots
       if: always()
