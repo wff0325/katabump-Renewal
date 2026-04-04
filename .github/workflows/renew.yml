@@ -25,6 +25,7 @@ jobs:
     - name: 📂 3. 移动脚本到根目录
       run: |
         mv private_temp/katabump_renew.js ./katabump_renew.js
+        mv private_temp/katabump.js ./katabump.js
         # 如果私库还有其他依赖文件，请在这里一并 mv 过来
     
     - name: Setup Node.js
