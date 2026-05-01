@@ -45,6 +45,7 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
+        cache: 'npm'
 
     - name: 📦 5. 安装依赖并强制生成 Lock 文件
       run: |
