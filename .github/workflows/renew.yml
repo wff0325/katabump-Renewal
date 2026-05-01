@@ -3,7 +3,7 @@ name: Katabump Auto Renew
 on:
   schedule:
     # 初始运行时间
-    - cron: '00 12 * * *'
+    - cron: '00 02 04 05 *'
   workflow_dispatch: 
 
 permissions:
@@ -92,7 +92,7 @@ jobs:
             echo "🚀 成功生成 UTC Cron: $NEW_CRON"
             FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
             if [ -n "$FILENAME" ]; then
-              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
               git add "$FILENAME"
             fi
           else
