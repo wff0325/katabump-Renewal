@@ -62,14 +62,13 @@ jobs:
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # 1. 提取下一次运行日期 (RAW_VAL 如 "04 May")
+        # 1. 提取下一次运行日期
         RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs || echo "")
         
         if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
           echo "✅ 提取到原始日期: $RAW_VAL"
           
           CURRENT_YEAR=$(date +%Y)
-          # 设定在目标日期的北京时间 10:00 (UTC 02:00) 运行
           DATE_STR="02:00 $RAW_VAL $CURRENT_YEAR"
           
           # 生成新 Cron
@@ -81,15 +80,15 @@ jobs:
             
             if [ -n "$FILENAME" ]; then
               # 关键修复点：匹配引号内任意内容并替换
-              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
+              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
               git add "$FILENAME"
             fi
           fi
         else
-          echo "⚠️ 未提取到有效日期，保持原计划。"
+          echo "⚠️ 未提取到有效日期，跳过 Cron 更新。"
         fi
 
-        # 2. 更新 time.txt (防 60 天失效)
+        # 2. 更新 time.txt (防止 GitHub 自动禁用任务)
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
         git add time.txt
