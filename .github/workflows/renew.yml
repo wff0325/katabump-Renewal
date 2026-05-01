@@ -79,8 +79,11 @@ jobs:
             FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
             
             if [ -n "$FILENAME" ]; then
-              # 关键修复点：匹配引号内任意内容并替换
-              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
+              # ✅ 修复后的 sed 命令：
+              # 1. 使用 '.*' 匹配引号内任何旧的 Cron 值
+              # 2. 确保有三个 @ 分隔符：s@查找@替换@g
+              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              echo "✅ 已成功更新 $FILENAME"
               git add "$FILENAME"
             fi
           fi
@@ -88,16 +91,16 @@ jobs:
           echo "⚠️ 未提取到有效日期，跳过 Cron 更新。"
         fi
 
-        # 2. 更新 time.txt (防止 GitHub 自动禁用任务)
+        # 2. 更新 time.txt (防止 GitHub 停掉 60 天未活跃的工作流)
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
         git add time.txt
 
         # 3. 提交并推送
         if git diff --staged --quiet; then
-          echo "内容无变化，跳过推送。"
+          echo "没有变化，跳过推送。"
         else
-          git commit -m "🔄 更新预约与 KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
+          git commit -m "🔄 自动续期任务: 下次预约 $RAW_VAL"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
