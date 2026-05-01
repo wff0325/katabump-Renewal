@@ -2,8 +2,8 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 初始运行时间
-    - cron: '00 02 04 05 *'
+    # 初始运行时间，成功后会自动被脚本修改
+    - cron: '00 12 * * *'
   workflow_dispatch: 
 
 permissions:
@@ -20,38 +20,29 @@ jobs:
       with:
         persist-credentials: false
 
-    - name: 📥 2. 下载私库
+    - name: 📥 2. 下载私库 (获取脚本)
       uses: actions/checkout@v4
       with:
         repository: ${{ github.repository_owner }}/Renew-Private 
         token: ${{ secrets.PRIVATE_REPO_TOKEN }}
         path: private_temp
 
-    - name: 📂 3. 准备脚本与依赖环境
+    - name: 📂 3. 准备脚本
       run: |
         mv private_temp/katabump_renew.js ./katabump_renew.js
-        echo '{
-          "name": "katabump-renew",
-          "version": "1.0.0",
-          "dependencies": {
-            "playwright": "1.41.0",
-            "playwright-extra": "^4.3.6",
-            "puppeteer-extra-plugin-stealth": "^2.11.2",
-            "axios": "^1.6.0"
-          }
-        }' > package.json
-
+    
     - name: 🟢 4. 设置 Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: 'npm' # 已有 lock 文件，直接开启缓存
 
-    - name: 📦 5. 安装依赖并强制生成 Lock 文件
+    - name: 📦 5. 安装依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
-        npm install
+        # 使用 npm ci 严格按照现有的 lock 文件安装，速度最快
+        npm ci
         npx playwright install --with-deps chrome
       
     - name: 🚀 6. 运行续费脚本
@@ -64,61 +55,57 @@ jobs:
         touch renew.log
         xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
 
-    - name: 🔄 7. 提取时间并提交所有新文件
+    - name: 🔄 7. 提取时间并更新 Cron & KeepAlive
       if: always()
       run: |
         echo "--- 日志内容检查 ---"
         if [ -f renew.log ]; then tail -n 25 renew.log; else echo "renew.log 不存在"; fi
         echo "------------------"
 
-        # 配置 Git
+        # 配置 Git 用户
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # 1. 提取时间逻辑 (RAW_VAL 可能是 "04 May")
+        # 1. 提取下一次运行日期 (RAW_VAL 如 "04 May")
         RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs || echo "")
         
         if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ] && [ "$RAW_VAL" != "" ]; then
           echo "✅ 提取到原始日期: $RAW_VAL"
           
-          # ❗ 修正：重新排列日期字符串顺序，并加上当前年份。
-          # 格式改为: "02:00 04 May 2026" (这是 Linux date 命令最喜欢的格式)
           CURRENT_YEAR=$(date +%Y)
+          # 设定在目标日期的北京时间 10:00 (UTC 02:00) 运行
           DATE_STR="02:00 $RAW_VAL $CURRENT_YEAR"
           
-          # 尝试转换。如果失败，NEW_CRON 为空
-          NEW_CRON=$(date -d "$DATE_STR" -u +"%M %H %d %m *" 2>/dev/null || echo "")
+          # ❗ 关键修复：tr -d '\n\r' 确保变量中绝对没有换行符，防止 sed 报错
+          NEW_CRON=$(date -d "$DATE_STR" -u +"%M %H %d %m *" 2>/dev/null | tr -d '\n\r' || echo "")
           
           if [ -n "$NEW_CRON" ]; then
             echo "🚀 成功生成 UTC Cron: $NEW_CRON"
+            # 自动定位 workflow 文件
             FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
+            
             if [ -n "$FILENAME" ]; then
-              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
+              # 使用 @ 分隔符防止冲突
+              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
               git add "$FILENAME"
             fi
-          else
-            echo "❌ 日期转换仍然失败: '$DATE_STR'"
           fi
         fi
 
-        # 2. 更新 time.txt
+        # 2. 更新 time.txt (防 60 天失效)
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
-        
-        # 3. 智能添加文件
         git add time.txt
-        [ -f package.json ] && git add package.json
-        [ -f package-lock.json ] && git add package-lock.json
 
-        # 4. 提交并强制推送
+        # 3. 提交并推送
         if git diff --staged --quiet; then
-          echo "没有内容变化，跳过推送。"
+          echo "内容无变化，跳过推送。"
         else
-          git commit -m "🔄 更新计划、环境与KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
+          git commit -m "🔄 更新预约与 KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
-    - name: Upload Screenshots
+    - name: 📸 8. 上传截图
       if: always()
       uses: actions/upload-artifact@v4
       with:
