@@ -29,10 +29,7 @@ jobs:
 
     - name: 📂 3. 准备脚本与依赖环境
       run: |
-        # 移动脚本
         mv private_temp/katabump_renew.js ./katabump_renew.js
-        
-        # 强制生成 package.json
         echo '{
           "name": "katabump-renew",
           "version": "1.0.0",
@@ -48,14 +45,11 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-        # ❗ 暂时移除 cache: 'npm'，直到我们成功提交了第一个 lock 文件
-        # 这样可以保证第一次运行 100% 不报错
 
     - name: 📦 5. 安装依赖并强制生成 Lock 文件
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
-        # npm i 会根据上面的 package.json 自动生成 package-lock.json
         npm install
         npx playwright install --with-deps chrome
       
@@ -66,7 +60,6 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
-        # 确保创建 log 文件，防止 tail 报错
         touch renew.log
         xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
 
@@ -74,22 +67,36 @@ jobs:
       if: always()
       run: |
         echo "--- 日志内容检查 ---"
-        if [ -f renew.log ]; then tail -n 20 renew.log; else echo "renew.log 不存在"; fi
+        if [ -f renew.log ]; then tail -n 25 renew.log; else echo "renew.log 不存在"; fi
         echo "------------------"
 
         # 配置 Git
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # 1. 提取时间逻辑
+        # 1. 提取时间逻辑 (RAW_VAL 可能是 "04 May")
         RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs || echo "")
-        if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
-          echo "✅ 发现下一次日期: $RAW_VAL"
-          NEW_CRON=$(date -d "$RAW_VAL 02:00" -u +"%M %H %d %m *")
-          FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
-          if [ -n "$FILENAME" ]; then
-            sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
-            git add "$FILENAME"
+        
+        if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ] && [ "$RAW_VAL" != "" ]; then
+          echo "✅ 提取到原始日期: $RAW_VAL"
+          
+          # ❗ 修正：重新排列日期字符串顺序，并加上当前年份。
+          # 格式改为: "02:00 04 May 2026" (这是 Linux date 命令最喜欢的格式)
+          CURRENT_YEAR=$(date +%Y)
+          DATE_STR="02:00 $RAW_VAL $CURRENT_YEAR"
+          
+          # 尝试转换。如果失败，NEW_CRON 为空
+          NEW_CRON=$(date -d "$DATE_STR" -u +"%M %H %d %m *" 2>/dev/null || echo "")
+          
+          if [ -n "$NEW_CRON" ]; then
+            echo "🚀 成功生成 UTC Cron: $NEW_CRON"
+            FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
+            if [ -n "$FILENAME" ]; then
+              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              git add "$FILENAME"
+            fi
+          else
+            echo "❌ 日期转换仍然失败: '$DATE_STR'"
           fi
         fi
 
@@ -97,8 +104,7 @@ jobs:
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
         
-        # 3. ❗ 关键：智能添加文件，防止 pathspec 报错
-        # 只有文件存在时才 add
+        # 3. 智能添加文件
         git add time.txt
         [ -f package.json ] && git add package.json
         [ -f package-lock.json ] && git add package-lock.json
@@ -107,7 +113,7 @@ jobs:
         if git diff --staged --quiet; then
           echo "没有内容变化，跳过推送。"
         else
-          git commit -m "🔄 初始化/更新环境、Cron与KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
+          git commit -m "🔄 更新计划、环境与KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
