@@ -3,7 +3,7 @@ name: Katabump Auto Renew
 on:
   schedule:
     # 初始运行时间，成功后会自动被脚本修改
-    - cron: '00 12 * * *'
+    - cron: '00 02 04 05 *'
   workflow_dispatch: 
 
 permissions:
@@ -86,7 +86,7 @@ jobs:
             
             if [ -n "$FILENAME" ]; then
               # 使用 @ 分隔符防止冲突
-              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
               git add "$FILENAME"
             fi
           fi
