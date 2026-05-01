@@ -81,7 +81,7 @@ jobs:
             
             if [ -n "$FILENAME" ]; then
               # 关键修复点：匹配引号内任意内容并替换
-              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
               git add "$FILENAME"
             fi
           fi
