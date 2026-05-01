@@ -27,84 +27,88 @@ jobs:
         token: ${{ secrets.PRIVATE_REPO_TOKEN }}
         path: private_temp
 
-    - name: 📂 3. 准备脚本
+    - name: 📂 3. 准备脚本与依赖环境
       run: |
         mv private_temp/katabump_renew.js ./katabump_renew.js
+        
+        # 只有在仓库里没有 package.json 时才创建它
         if [ ! -f "package.json" ]; then
-          echo '{"dependencies": {"playwright-extra": "^4.3.6", "puppeteer-extra-plugin-stealth": "^2.11.2", "axios": "^1.6.0"}}' > package.json
+          echo '{
+            "name": "katabump-renew",
+            "version": "1.0.0",
+            "dependencies": {
+              "playwright": "1.41.0",
+              "playwright-extra": "^4.3.6",
+              "puppeteer-extra-plugin-stealth": "^2.11.2",
+              "axios": "^1.6.0"
+            }
+          }' > package.json
         fi
     
-    - name: Setup Node.js
+    - name: 🟢 4. 设置 Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
+        # ❗ 开启缓存。第一次运行会因为没 lock 文件而跳过，但成功运行一次后就会生效
         cache: 'npm'
-        
-    - name: Install Dependencies
+        cache-dependency-path: package-lock.json
+
+    - name: 📦 5. 安装依赖并生成 Lock 文件
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
+        # 如果没有 lock 文件，npm install 会自动生成一个
         npm install
         npx playwright install --with-deps chrome
       
-    - name: Run Renew Script
+    - name: 🚀 6. 运行续费脚本
       env:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      # ❗ 记录日志到 renew.log
-      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
+      run: |
+        touch renew.log
+        xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
 
-    - name: 🔄 4. 提取时间并更新 Cron & KeepAlive
+    - name: 🔄 7. 提取时间并更新 Cron & 持久化 Lock 文件
       if: always()
       run: |
         echo "--- 日志末尾内容 ---"
-        tail -n 20 renew.log
+        tail -n 20 renew.log || echo "log file is empty"
         echo "------------------"
 
-        # 1. 尝试提取 [NEXT_TIME] 标记后的日期 (例如 04 May)
-        RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | awk -F' ' '{print $2, $3}' | tail -1)
-        
-        # 兼容性：如果没抓到，尝试抓取你提供的日志格式 "下次可用: 04 May"
-        if [ -z "$RAW_VAL" ]; then
-           RAW_VAL=$(grep "下次可用:" renew.log | awk -F': ' '{print $2}' | tail -1)
-        fi
-        
         # 配置 Git 用户
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # 2. 如果抓到了日期
-        if [ -n "$RAW_VAL" ]; then
-          echo "✅ 发现下次可用日期: $RAW_VAL"
-          
-          # 转换为 UTC 格式。
-          # 因为日志只有日期，我们设定在该日期的北京时间 10:00 (UTC 02:00) 运行
+        # 1. 提取时间逻辑
+        RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs)
+        if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
+          echo "✅ 发现下一次日期: $RAW_VAL"
           NEW_CRON=$(date -d "$RAW_VAL 02:00" -u +"%M %H %d %m *")
-          
-          echo "🚀 新生成的 UTC Cron: $NEW_CRON"
-          
-          # 自动定位文件并修改
           FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
           sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
           git add "$FILENAME"
         fi
 
-        # 3. 更新 time.txt (防止任务被 GitHub 自动禁用)
+        # 2. 更新 time.txt (防止 60 天任务被禁用)
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
         git add time.txt
 
-        # 4. 提交并强制推送 (使用你的私库高级 Token)
+        # 3. ❗ 关键：提交 package.json 和新生成的 package-lock.json
+        git add package.json package-lock.json
+
+        # 4. 提交并强制推送
         if git diff --staged --quiet; then
-          echo "没有变化，跳过推送。"
+          echo "没有内容变化，跳过推送。"
         else
-          git commit -m "🔄 KeepAlive & 自动预约: ${RAW_VAL:-$CURRENT_TIME}"
+          git commit -m "🔄 KeepAlive, Cron & Dependencies Update: ${RAW_VAL:-$CURRENT_TIME}"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
-    - name: Upload Screenshots
+    - name: 📸 8. 上传截图
       if: always()
       uses: actions/upload-artifact@v4
       with:
