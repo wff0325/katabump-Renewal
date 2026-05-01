@@ -82,7 +82,7 @@ jobs:
               # ✅ 修复后的 sed 命令：
               # 1. 使用 '.*' 匹配引号内任何旧的 Cron 值
               # 2. 确保有三个 @ 分隔符：s@查找@替换@g
-              sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+              sed -i "s@cron: '00 02 04 05 *'@g" "$FILENAME"
               echo "✅ 已成功更新 $FILENAME"
               git add "$FILENAME"
             fi
