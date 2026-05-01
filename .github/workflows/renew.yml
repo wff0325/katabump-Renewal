@@ -70,31 +70,37 @@ jobs:
           
           CURRENT_YEAR=$(date +%Y)
           DATE_STR="02:00 $RAW_VAL $CURRENT_YEAR"
+          # 生成 UTC Cron
           NEW_CRON=$(date -d "$DATE_STR" -u +"%M %H %d %m *" 2>/dev/null | tr -d '\n\r' || echo "")
           
           if [ -n "$NEW_CRON" ]; then
-            echo "🚀 新 Cron: $NEW_CRON"
-            FILENAME=".github/workflows/renew.yml" # 直接指定你的文件名，更安全
+            echo "🚀 目标新 Cron: $NEW_CRON"
+            # 自动寻找文件名，防止硬编码错误
+            FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
 
-            if [ -f "$FILENAME" ]; then
-              # ⭐ 关键修复：使用 0,/cron:/ 确保只替换文件中的【第一个】匹配项
-              # 这样它只会改顶部的 schedule，而不会改到下面这行 sed 代码本身！
-              sed -i "0,/cron:/s@cron: '.*'@cron: '$NEW_CRON'@" "$FILENAME"
-              echo "✅ 已成功更新 $FILENAME 的定时任务"
+            if [ -n "$FILENAME" ]; then
+              # ⭐ 终极兼容匹配：
+              # s@cron:.*@... 会吃掉 cron: 之后的所有空格和引号，直接替换成标准格式
+              # 0,/cron:/ 确保只改顶部的 schedule，不改脚本自己
+              sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
+              
+              echo "🔍 验证修改结果（显示文件中的第一行 cron）："
+              grep "cron:" "$FILENAME" | head -n 1
+              
               git add "$FILENAME"
             fi
           fi
         else
-          echo "⚠️ 未找到有效日期，保持原样。"
+          echo "⚠️ 未找到有效日期，跳过 Cron 更新。"
         fi
 
         # 3. 更新 time.txt (KeepAlive)
-        echo "Last run: $(date)" > time.txt
+        echo "最后运行时间: $(date)" > time.txt
         git add time.txt
 
         # 4. 提交推送
         if git diff --staged --quiet; then
-          echo "无变化，跳过推送。"
+          echo "没有内容变化（可能是日期未变），跳过推送。"
         else
           git commit -m "🔄 自动续期: 下次预约 $RAW_VAL"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
