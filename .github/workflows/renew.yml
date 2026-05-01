@@ -29,35 +29,33 @@ jobs:
 
     - name: 📂 3. 准备脚本与依赖环境
       run: |
+        # 移动脚本
         mv private_temp/katabump_renew.js ./katabump_renew.js
         
-        # 只有在仓库里没有 package.json 时才创建它
-        if [ ! -f "package.json" ]; then
-          echo '{
-            "name": "katabump-renew",
-            "version": "1.0.0",
-            "dependencies": {
-              "playwright": "1.41.0",
-              "playwright-extra": "^4.3.6",
-              "puppeteer-extra-plugin-stealth": "^2.11.2",
-              "axios": "^1.6.0"
-            }
-          }' > package.json
-        fi
-    
+        # 强制生成 package.json
+        echo '{
+          "name": "katabump-renew",
+          "version": "1.0.0",
+          "dependencies": {
+            "playwright": "1.41.0",
+            "playwright-extra": "^4.3.6",
+            "puppeteer-extra-plugin-stealth": "^2.11.2",
+            "axios": "^1.6.0"
+          }
+        }' > package.json
+
     - name: 🟢 4. 设置 Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-        # ❗ 开启缓存。第一次运行会因为没 lock 文件而跳过，但成功运行一次后就会生效
-        cache: 'npm'
-        cache-dependency-path: package-lock.json
+        # ❗ 暂时移除 cache: 'npm'，直到我们成功提交了第一个 lock 文件
+        # 这样可以保证第一次运行 100% 不报错
 
-    - name: 📦 5. 安装依赖并生成 Lock 文件
+    - name: 📦 5. 安装依赖并强制生成 Lock 文件
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
-        # 如果没有 lock 文件，npm install 会自动生成一个
+        # npm i 会根据上面的 package.json 自动生成 package-lock.json
         npm install
         npx playwright install --with-deps chrome
       
@@ -68,47 +66,52 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
+        # 确保创建 log 文件，防止 tail 报错
         touch renew.log
         xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
 
-    - name: 🔄 7. 提取时间并更新 Cron & 持久化 Lock 文件
+    - name: 🔄 7. 提取时间并提交所有新文件
       if: always()
       run: |
-        echo "--- 日志末尾内容 ---"
-        tail -n 20 renew.log || echo "log file is empty"
+        echo "--- 日志内容检查 ---"
+        if [ -f renew.log ]; then tail -n 20 renew.log; else echo "renew.log 不存在"; fi
         echo "------------------"
 
-        # 配置 Git 用户
+        # 配置 Git
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
         # 1. 提取时间逻辑
-        RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs)
+        RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs || echo "")
         if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
           echo "✅ 发现下一次日期: $RAW_VAL"
           NEW_CRON=$(date -d "$RAW_VAL 02:00" -u +"%M %H %d %m *")
           FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
-          sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
-          git add "$FILENAME"
+          if [ -n "$FILENAME" ]; then
+            sed -i "s@cron: '.*'@cron: '$NEW_CRON'@g" "$FILENAME"
+            git add "$FILENAME"
+          fi
         fi
 
-        # 2. 更新 time.txt (防止 60 天任务被禁用)
+        # 2. 更新 time.txt
         CURRENT_TIME=$(date +'%Y-%m-%d %H:%M:%S')
         echo "最后运行时间：$CURRENT_TIME" > time.txt
+        
+        # 3. ❗ 关键：智能添加文件，防止 pathspec 报错
+        # 只有文件存在时才 add
         git add time.txt
-
-        # 3. ❗ 关键：提交 package.json 和新生成的 package-lock.json
-        git add package.json package-lock.json
+        [ -f package.json ] && git add package.json
+        [ -f package-lock.json ] && git add package-lock.json
 
         # 4. 提交并强制推送
         if git diff --staged --quiet; then
           echo "没有内容变化，跳过推送。"
         else
-          git commit -m "🔄 KeepAlive, Cron & Dependencies Update: ${RAW_VAL:-$CURRENT_TIME}"
+          git commit -m "🔄 初始化/更新环境、Cron与KeepAlive: ${RAW_VAL:-$CURRENT_TIME}"
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
-    - name: 📸 8. 上传截图
+    - name: Upload Screenshots
       if: always()
       uses: actions/upload-artifact@v4
       with:
