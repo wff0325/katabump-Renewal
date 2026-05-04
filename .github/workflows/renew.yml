@@ -3,7 +3,7 @@ name: Katabump Auto Renew
 on:
   schedule:
     # 初始运行时间，成功后会自动被脚本修改
-    - cron: '00 02 04 05 *'
+    - cron: '05 02 08 05 *'
   workflow_dispatch: 
 
 permissions:
