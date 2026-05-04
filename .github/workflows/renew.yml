@@ -1,124 +1,148 @@
-name: Katabump Auto Renew
+name: Host2Play 自动续期
 
 on:
   schedule:
     # 初始运行时间，成功后会自动被脚本修改
-    - cron: '05 02 08 05 *'
-  workflow_dispatch: 
+    - cron: '0 0,11,22 * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: write
   actions: write
+  contents: write
 
 jobs:
-  renew:
+  run-renew:
+    name: 执行续订
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: 📥 1. 下载公开库
-      uses: actions/checkout@v4
-      with:
-        persist-credentials: false
+      - name: 📥 1. 拉取当前仓库
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-    - name: 📥 2. 下载私库 (获取脚本)
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.repository_owner }}/Renew-Private 
-        token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        path: private_temp
+      - name: 📥 2. 拉取私有仓库脚本
+        uses: actions/checkout@v4
+        with:
+          repository: wff0325/Renew-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private_temp
 
-    - name: 📂 3. 准备脚本
-      run: |
-        mv private_temp/katabump_renew.js ./katabump_renew.js
-    
-    - name: 🟢 4. 设置 Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        cache: 'npm' # 已有 lock 文件，直接开启缓存
+      - name: 📂 3. 准备脚本文件
+        run: |
+          # 将私库里的脚本移动到当前目录
+          mv private_temp/Host2Play.py ./main.py
 
-    - name: 📦 5. 安装依赖
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y xvfb
-        # 使用 npm ci 严格按照现有的 lock 文件安装，速度最快
-        npm ci
-        npx playwright install --with-deps chrome
-      
-    - name: 🚀 6. 运行续费脚本
-      env:
-        USERS_JSON: ${{ secrets.USERS_JSON }}
-        HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
-        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      run: |
-        touch renew.log
-        xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node katabump_renew.js 2>&1 | tee renew.log
+      - name: 🟢 4. 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: 🔄 7. 提取时间并更新 Cron & KeepAlive
-      if: always()
-      run: |
-        # 1. 配置 Git
-        git config --local user.name "github-actions[bot]"
-        git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: 🛠️ 5. 安装系统依赖与 Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb ffmpeg unzip curl
+          wget -q -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i /tmp/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
 
-        # 2. 灵活提取日期
-        RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -1 | sed 's/.*\[NEXT_TIME\] //' | xargs || echo "")
+      - name: 📦 6. 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install DrissionPage xvfbwrapper requests SpeechRecognition pydub
 
-        # 尝试 B: 如果 A 没找到，检查是否续期成功
-        if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
-          if grep -q "Renew successful" renew.log; then
-            echo "✅ 续期成功，预约 24 小时后重新检查。"
-            RAW_VAL=$(date -d "+1 day" "+%d %b")
+      - name: 🌐 7. 启用 WARP 网络 (解决 IP 限制)
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 🔧 8. 修复 DNS 并检查网络
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "[INFO] 当前出口 IP:"
+          curl -s --max-time 10 https://api.ipify.org || echo "无法获取 IP"
+
+      - name: 🚀 9. 执行续订脚本
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          # 使用 xvfb 虚拟显示运行，并将输出保存到 renew.log 以便后续提取时间
+          touch renew.log
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python main.py 2>&1 | tee renew.log
+
+      - name: 🔄 10. 提取时间并自动更新 Cron
+        if: always()
+        run: |
+          # 1. 配置 Git 身份
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 2. 从日志中提取 [NEXT_TIME] 后的日期 (例如 "08 May")
+          RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -1 | sed 's/.*\[NEXT_TIME\] //' | xargs || echo "")
+
+          # 如果提取失败但脚本显示成功，设定一个保底时间（比如 24 小时后）
+          if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
+            if grep -q "Renew successful" renew.log || grep -q "成功" renew.log; then
+              RAW_VAL=$(date -d "+1 day" "+%d %b")
+            fi
           fi
-        fi
 
-        echo "🔍 提取到的日期字符串: '$RAW_VAL'"
+          echo "🔍 提取到的日期: '$RAW_VAL'"
 
-        NEW_CRON=""
-        if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
-          # --- 核心修复：更健壮的日期解析 ---
-          # 将 "08 May" 转换为 "08-May"，这在 Linux 下是极稳健的格式
-          SAFE_DATE=$(echo "$RAW_VAL" | sed 's/ /-/g')
-          
-          # 分别提取月(%m)和日(%d)
-          T_D=$(date -d "$SAFE_DATE" +"%d" 2>/dev/null || echo "")
-          T_M=$(date -d "$SAFE_DATE" +"%m" 2>/dev/null || echo "")
+          NEW_CRON=""
+          if [ -n "$RAW_VAL" ]; then
+            # 格式化日期为可解析格式
+            SAFE_DATE=$(echo "$RAW_VAL" | sed 's/ /-/g')
+            T_D=$(date -d "$SAFE_DATE" +"%d" 2>/dev/null || echo "")
+            T_M=$(date -d "$SAFE_DATE" +"%m" 2>/dev/null || echo "")
 
-          if [ -n "$T_D" ] && [ -n "$T_M" ]; then
-            # 设定在目标日期的 UTC 02:05 运行 (即北京时间 10:05)
-            NEW_CRON="05 02 $T_D $T_M *"
-            echo "🚀 生成的新 Cron: $NEW_CRON"
+            if [ -n "$T_D" ] && [ -n "$T_M" ]; then
+              # 设定在目标日期的 UTC 02:05 运行
+              NEW_CRON="05 02 $T_D $T_M *"
+              echo "🚀 新 Cron 表达式: $NEW_CRON"
+            fi
           fi
-        fi
 
-        # 3. 更新文件
-        if [ -n "$NEW_CRON" ]; then
-          FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
-          if [ -n "$FILENAME" ]; then
-            # 替换 cron 所在的行
-            sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
-            echo "✅ 已更新 $FILENAME 中的 Cron 配置"
-            git add "$FILENAME"
+          # 3. 写入文件
+          if [ -n "$NEW_CRON" ]; then
+            FILENAME=".github/workflows/$(basename ${{ github.event.workflow_run.path || 'host2play.yml' }})"
+            # 兼容性查找当前 workflow 文件
+            WORKFLOW_FILE=$(grep -l "name: Host2Play 自动续期" .github/workflows/*.yml | head -n 1)
+            if [ -n "$WORKFLOW_FILE" ]; then
+              sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$WORKFLOW_FILE"
+              git add "$WORKFLOW_FILE"
+            fi
           fi
-        else
-          echo "⚠️ 转换失败或未找到日期，跳过 Cron 更新。"
-        fi
 
-        # 4. 更新 time.txt (KeepAlive) 并提交
-        echo "最后运行时间: $(date)" > time.txt
-        git add time.txt
+          # 4. 更新 KeepAlive 避免仓库停滞
+          echo "Last run: $(date)" > last_run.txt
+          git add last_run.txt
 
-        if git diff --staged --quiet; then
-          echo "没有内容变化，跳过推送。"
-        else
-          git commit -m "🔄 自动续期: 下次预约 $RAW_VAL"
-          git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
-        fi
+          # 5. 提交并推送
+          if git diff --staged --quiet; then
+            echo "没有变化，跳过推送。"
+          else
+            git commit -m "🔄 自动更新下次续期时间: $RAW_VAL"
+            git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
+          fi
 
-    - name: 📸 8. 上传截图
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: screenshots
-        path: screenshots/
+      - name: 📸 11. 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 🧹 12. 清理运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 2
