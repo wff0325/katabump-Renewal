@@ -63,57 +63,56 @@ jobs:
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
         # 2. 灵活提取日期
-        RAW_VAL=""
-        
-        # 尝试 A: 寻找脚本明确输出的下次可用时间 (还没到时间的情况)
-        # 匹配 [NEXT_TIME] 之后的所有内容
         RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -1 | sed 's/.*\[NEXT_TIME\] //' | xargs || echo "")
 
         # 尝试 B: 如果 A 没找到，检查是否续期成功
         if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
           if grep -q "Renew successful" renew.log; then
-            echo "✅ 脚本运行成功，自动预约 24 小时后重新检查。"
-            # 生成明天的这个时间
-            RAW_VAL=$(date -d "+1 day" "+%b %d, %Y")
+            echo "✅ 续期成功，预约 24 小时后重新检查。"
+            RAW_VAL=$(date -d "+1 day" "+%d %b")
           fi
         fi
 
-        echo "🔍 最终提取的日期字符串: '$RAW_VAL'"
+        echo "🔍 提取到的日期字符串: '$RAW_VAL'"
 
+        NEW_CRON=""
         if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
-          CURRENT_YEAR=$(date +%Y)
-          # 强制指定在 UTC 02:05 运行，增加 5 分钟缓冲
-          # date -d 能够识别 "May 05, 2024" 这种格式
-          NEW_CRON=$(date -d "$RAW_VAL 02:05" -u +"%M %H %d %m *" 2>/dev/null || echo "")
+          # --- 核心修复：更健壮的日期解析 ---
+          # 将 "08 May" 转换为 "08-May"，这在 Linux 下是极稳健的格式
+          SAFE_DATE=$(echo "$RAW_VAL" | sed 's/ /-/g')
           
-          if [ -n "$NEW_CRON" ]; then
-            echo "🚀 目标新 Cron: $NEW_CRON"
-            FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
+          # 分别提取月(%m)和日(%d)
+          T_D=$(date -d "$SAFE_DATE" +"%d" 2>/dev/null || echo "")
+          T_M=$(date -d "$SAFE_DATE" +"%m" 2>/dev/null || echo "")
 
-            if [ -n "$FILENAME" ]; then
-              # 使用 @ 作为定界符，防止变量中带斜杠导致 sed 出错
-              sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
-              echo "🔍 验证修改结果："
-              grep "cron:" "$FILENAME" | head -n 1
-              git add "$FILENAME"
-            fi
-          else
-            echo "❌ 日期转换失败，RAW_VAL 格式无法解析。"
+          if [ -n "$T_D" ] && [ -n "$T_M" ]; then
+            # 设定在目标日期的 UTC 02:05 运行 (即北京时间 10:05)
+            NEW_CRON="05 02 $T_D $T_M *"
+            echo "🚀 生成的新 Cron: $NEW_CRON"
+          fi
+        fi
+
+        # 3. 更新文件
+        if [ -n "$NEW_CRON" ]; then
+          FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
+          if [ -n "$FILENAME" ]; then
+            # 替换 cron 所在的行
+            sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
+            echo "✅ 已更新 $FILENAME 中的 Cron 配置"
+            git add "$FILENAME"
           fi
         else
-          echo "⚠️ 未找到有效日期（可能脚本报错或登录失败），跳过 Cron 更新。"
+          echo "⚠️ 转换失败或未找到日期，跳过 Cron 更新。"
         fi
 
-        # 3. 更新 time.txt (KeepAlive)
+        # 4. 更新 time.txt (KeepAlive) 并提交
         echo "最后运行时间: $(date)" > time.txt
         git add time.txt
 
-        # 4. 提交推送
         if git diff --staged --quiet; then
           echo "没有内容变化，跳过推送。"
         else
           git commit -m "🔄 自动续期: 下次预约 $RAW_VAL"
-          # 使用 force 确保即便 Actions 运行频率高也能推上去
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
