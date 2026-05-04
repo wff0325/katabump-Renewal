@@ -62,36 +62,46 @@ jobs:
         git config --local user.name "github-actions[bot]"
         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        # 2. 提取日期
-        RAW_VAL=$(grep -E "\[NEXT_TIME\]|下次可用:" renew.log | awk -F'(: |] )' '{print $2}' | tail -1 | xargs || echo "")
+        # 2. 灵活提取日期
+        RAW_VAL=""
         
+        # 尝试 A: 寻找脚本明确输出的下次可用时间 (还没到时间的情况)
+        # 匹配 [NEXT_TIME] 之后的所有内容
+        RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -1 | sed 's/.*\[NEXT_TIME\] //' | xargs || echo "")
+
+        # 尝试 B: 如果 A 没找到，检查是否续期成功
+        if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
+          if grep -q "Renew successful" renew.log; then
+            echo "✅ 脚本运行成功，自动预约 24 小时后重新检查。"
+            # 生成明天的这个时间
+            RAW_VAL=$(date -d "+1 day" "+%b %d, %Y")
+          fi
+        fi
+
+        echo "🔍 最终提取的日期字符串: '$RAW_VAL'"
+
         if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
-          echo "✅ 提取日期成功: $RAW_VAL"
-          
           CURRENT_YEAR=$(date +%Y)
-          DATE_STR="02:00 $RAW_VAL $CURRENT_YEAR"
-          # 生成 UTC Cron
-          NEW_CRON=$(date -d "$DATE_STR" -u +"%M %H %d %m *" 2>/dev/null | tr -d '\n\r' || echo "")
+          # 强制指定在 UTC 02:05 运行，增加 5 分钟缓冲
+          # date -d 能够识别 "May 05, 2024" 这种格式
+          NEW_CRON=$(date -d "$RAW_VAL 02:05" -u +"%M %H %d %m *" 2>/dev/null || echo "")
           
           if [ -n "$NEW_CRON" ]; then
             echo "🚀 目标新 Cron: $NEW_CRON"
-            # 自动寻找文件名，防止硬编码错误
             FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
 
             if [ -n "$FILENAME" ]; then
-              # ⭐ 终极兼容匹配：
-              # s@cron:.*@... 会吃掉 cron: 之后的所有空格和引号，直接替换成标准格式
-              # 0,/cron:/ 确保只改顶部的 schedule，不改脚本自己
+              # 使用 @ 作为定界符，防止变量中带斜杠导致 sed 出错
               sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
-              
-              echo "🔍 验证修改结果（显示文件中的第一行 cron）："
+              echo "🔍 验证修改结果："
               grep "cron:" "$FILENAME" | head -n 1
-              
               git add "$FILENAME"
             fi
+          else
+            echo "❌ 日期转换失败，RAW_VAL 格式无法解析。"
           fi
         else
-          echo "⚠️ 未找到有效日期，跳过 Cron 更新。"
+          echo "⚠️ 未找到有效日期（可能脚本报错或登录失败），跳过 Cron 更新。"
         fi
 
         # 3. 更新 time.txt (KeepAlive)
@@ -100,9 +110,10 @@ jobs:
 
         # 4. 提交推送
         if git diff --staged --quiet; then
-          echo "没有内容变化（可能是日期未变），跳过推送。"
+          echo "没有内容变化，跳过推送。"
         else
           git commit -m "🔄 自动续期: 下次预约 $RAW_VAL"
+          # 使用 force 确保即便 Actions 运行频率高也能推上去
           git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
         fi
 
