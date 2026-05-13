@@ -67,7 +67,7 @@ jobs:
 
           # 2. 灵活提取日期
           # 提取 [NEXT_TIME] 后面的日期字符串
-          RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail - 1 | sed 's/.*\[NEXT_TIME\] //' | xargs || echo "")
+          RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -n 1 | sed 's/.*\[NEXT_TIME\] //' | xargs)
 
           # 尝试 B: 如果 A 没找到，检查是否续期成功
           if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
