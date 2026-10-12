@@ -2,128 +2,72 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 初始运行时间，成功后会自动被脚本修改
-    - cron: '05 02 10 10 *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  actions: write
+  - cron: '30 22 */3 * *'  # 每天 UTC 22:30 (北京时间 6:30点) 运行,根据服务到期时间自行修改
+  workflow_dispatch: # 允许手动触发
 
 jobs:
-  renew:
+  Renew-Katabump:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    
     steps:
-      - name: 📥 1. 下载公开库
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+    - uses: actions/checkout@v6
+    - name: ⚙ 设置 Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
 
-      - name: 📥 2. 下载私库(获取脚本)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/Renew-Private
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          path: private_temp
+    - name: 🛠️ 安装系统依赖和python依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+        pip install seleniumbase requests
+        seleniumbase install chromedriver
 
-      - name: 📂 3. 准备脚本
-        run: |
-          # 将私库中的脚本移动到根目录
-          mv private_temp/katabump_renew.js .
-          # 清理临时文件夹
-          rm -rf private_temp
+    - name: ⚙ 设置代理 (sing-box)
+      continue-on-error: true
+      env:
+        NODE_LINK: ${{ secrets.NODE_LINK }}
+      run: |
+        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🟢 4. 设置 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
+    - name: 🚀 运行续期脚本
+      env:
+        KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+        KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      run: |
+        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+          python3 app.py
 
-      - name: 📦 5. 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          npm ci
-          npx playwright install --with-deps chrome
-
-      - name: 🚀 6. 运行续费脚本
-        env:
-          USERS_JSON: ${{ secrets.USERS_JSON }}
-          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          touch renew.log
-          # 使用 xvfb-run 模拟显示环境运行 playwright
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
-          node katabump_renew.js 2>&1 | tee renew.log
-
-      - name: 🔄 7. 提取时间并更新 Cron & KeepAlive
-        if: always()
-        run: |
-          # 1. 配置 Git
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 2. 灵活提取日期
-          # 提取 [NEXT_TIME] 后面的日期字符串
-          RAW_VAL=$(grep "\[NEXT_TIME\]" renew.log | tail -n 1 | sed 's/.*\[NEXT_TIME\] //' | xargs)
-
-          # 尝试 B: 如果 A 没找到，检查是否续期成功
-          if [ -z "$RAW_VAL" ] || [ "$RAW_VAL" = "Unknown Date" ]; then
-            if grep -q "Renew successful" renew.log; then
-              echo "✅ 续期成功，预约 24 小时后重新检查。"
-              RAW_VAL=$(date -d "+1 day" "+%d %b")
-            fi
+    # 更新时间到time.txt,避免90天未更新导致工作流暂停
+    - name: 🕒 更新运行时间
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+        git add time.txt
+        if git diff --cached --quiet; then
+          echo "No need to commit"
+        else
+          git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+          git push origin main
+        fi
+        
+    - name: 🧹 清理旧的工作流运行记录
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
           fi
-
-          echo "🔍 提取到的日期字符串: '$RAW_VAL'"
-
-          NEW_CRON=""
-          if [ -n "$RAW_VAL" ] && [ "$RAW_VAL" != "Unknown Date" ]; then
-            # 将 "08 May" 转换为 "08-May"，确保 date 命令能正确解析
-            SAFE_DATE=$(echo "$RAW_VAL" | sed 's/ /-/g')
-            
-            # 提取月(%m) 和 日(%d)
-            T_D=$(date -d "$SAFE_DATE" +%d 2>/dev/null || echo "")
-            T_M=$(date -d "$SAFE_DATE" +%m 2>/dev/null || echo "")
-
-            if [ -n "$T_D" ] && [ -n "$T_M" ]; then
-              # 设定在目标日期的 UTC 02:05 运行 (北京时间 10:05)
-              NEW_CRON="05 02 $T_D $T_M *"
-              echo "🚀 生成的新 Cron: $NEW_CRON"
-            fi
-          fi
-
-          # 3. 更新 Workflow 文件中的 Cron 配置
-          if [ -n "$NEW_CRON" ]; then
-            FILENAME=$(grep -l "cron:" .github/workflows/*.yml | head -n 1)
-            if [ -n "$FILENAME" ]; then
-              sed -i "0,/cron:/s@cron:.*@cron: '$NEW_CRON'@" "$FILENAME"
-              echo "✅ 已更新 $FILENAME 中的 Cron 配置"
-              git add "$FILENAME"
-            else
-              echo "⚠️ 未找到包含 cron: 的 YAML 文件，跳过更新。"
-            fi
-          else
-            echo "⚠️ 转换失败或未找到日期，跳过 Cron 更新。"
-          fi
-
-          # 4. 更新 time.txt (KeepAlive) 并提交
-          echo "最后运行时间: $(date)" > time.txt
-          git add time.txt
-
-          if git diff --staged --quiet; then
-            echo "没有内容变化，跳过推送。"
-          else
-            git commit -m "🔄 自动续期: 下次预约 $RAW_VAL"
-            # 使用 Token 推送到 main 分支
-            git push "https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main --force
-          fi
-
-      - name: 📸 8. 上传截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: screenshots/
+        done
