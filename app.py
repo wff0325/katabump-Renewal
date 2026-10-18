@@ -104,7 +104,7 @@ def send_telegram_notification(status, old_expiry, new_expiry, current_ip="未�
         f"时间: {now}"
     )
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+        resp = requests.post(f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage",
                              json={"chat_id": TG_CHAT_ID, "text": text},
                              timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
