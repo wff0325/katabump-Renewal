@@ -5,11 +5,13 @@ KataBump 服务器自动续期脚本(修复版)
 原项目: https://github.com/wff0325/katabump-Renewal (存在结果误判/确认不可靠问题)
 
 修复点:
-  1. 续期结果以「Expiry 日期变化」为准，不再读页面第一条 alert
-     (原版会把 Change type 区块的常驻警告当成续期结果)
-  2. 模态框内为 ALTCHA 验证(auto="onsubmit" 自动解题)，点击 submit 后
-     等待表单 POST 完成并校验到期时间，验证未过时自动重点
-  3. 登录 Turnstile 用 patchright + 真实浏览器点击，过 CF 盾
+  1. 续期结果以「可见 alert + Expiry 日期变化」判定，不再读页面第一条 alert
+     (原版会把 Change type 区块的常驻隐藏警告当成续期结果, 发出假成功通知)
+  2. Renew 按钮用 data-bs-target="#renew-modal" 精确定位
+     (原版 button:has-text("Renew") 大小写不敏感会先点到 "Easy renewal" 手风琴)
+  3. ALTCHA 验证检测只认 widget 自身字段(name 含 altcha), 不用"模态框内任意 hidden input"
+     (CSRF 字段会永远满足导致误判; 且验证过程中不重复点击提交, 否则会中断/重置 PoW 解题,
+     表单永远发不出去 —— GitHub Actions 实测教训)
 
 用法:
     本地:  .env 写入 KATABUMP_EMAIL/KATABUMP_PASSWORD 后 python app.py
@@ -104,7 +106,7 @@ def send_telegram_notification(status, old_expiry, new_expiry, current_ip="未�
         f"时间: {now}"
     )
     try:
-        resp = requests.post(f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage",
+        resp = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                              json={"chat_id": TG_CHAT_ID, "text": text},
                              timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
@@ -281,7 +283,9 @@ def _altcha_verified(page):
         return page.evaluate("""() => {
             const w = document.querySelector('.modal.show altcha-widget, #renew-modal altcha-widget');
             if (w && (w.getAttribute('data-state') || '') === 'verified') return true;
-            const inp = document.querySelector('.modal.show input[type="hidden"]');
+            // 只认 ALTCHA widget 自己的隐藏字段(name 含 altcha),
+            // 不要用 '模态框内任意 hidden input' —— CSRF 字段会永远满足导致误判!
+            const inp = document.querySelector('input[name*="altcha" i]');
             return !!(inp && inp.value && inp.value.length > 20);
         }""")
     except Exception:
@@ -517,30 +521,64 @@ def renew_server(page):
             return False, old_expiry
         log("Renew 模态框已弹出")
 
+        # 挂上 ALTCHA 诊断监听(失败时输出原因: 被墙/DNS/超时等)
+        console_msgs, failed_reqs = [], []
+        def _on_console(m):
+            try:
+                if 'altcha' in (m.text or '').lower():
+                    console_msgs.append(f"{m.type}: {m.text[:200]}")
+            except Exception:
+                pass
+        def _on_reqfailed(r):
+            try:
+                if 'altcha' in (r.url or ''):
+                    failed_reqs.append(f"{r.url[:150]} -> {r.failure}")
+            except Exception:
+                pass
+        page.on("console", _on_console)
+        page.on("requestfailed", _on_reqfailed)
+
         # 模态框内的 Renew 提交按钮(带 data-altcha-wired)
         submit = page.locator('#renew-modal button[type="submit"].btn-primary').first
         log("点击模态框 Renew 提交(ALTCHA 将自动解题)...")
         submit.click(timeout=10000)
 
-        # ALTCHA 自动解题(auto="onsubmit"): 验证通过后表单才真正提交。
-        # 点击提交 -> 等 ALTCHA 验证 -> 模态框关闭(表单提交/跳转)为止;
-        # 若验证后模态框仍在, 需要再点一次提交。
-        altcha_deadline = time.time() + 45
+        # ALTCHA 自动解题(auto="onsubmit"): 首次点击后 ALTCHA 开始 PoW 解题,
+        # 完成后自动提交表单。关键: 验证过程中【不要重复点击】——
+        # 反复点击会中断/重置验证, 导致表单永远发不出去(GitHub Actions 实测教训)。
+        # 只在 data-state=verified 但模态框仍未关时补点一次。
+        altcha_deadline = time.time() + 90
+        resubmitted = False
+        last_state = None
         while time.time() < altcha_deadline:
             time.sleep(2)
             if page.locator('#renew-modal.show').count() == 0:
+                log("表单已提交")
                 break
-            if _altcha_verified(page):
-                log("ALTCHA 已验证, 再次点击提交...")
+            state = _altcha_state(page)
+            if state != last_state:
+                log(f"ALTCHA 状态: {state}")
+                last_state = state
+            if state == 'verified' and not resubmitted:
+                log("ALTCHA 已验证但模态框未关, 补点一次提交...")
                 try:
                     page.locator('#renew-modal button[type="submit"].btn-primary').first.click(timeout=8000)
                 except Exception:
                     pass
+                resubmitted = True
+                time.sleep(4)
+            elif state in ('error', 'expired') and not resubmitted:
+                log(f"ALTCHA 异常({state}), 重新提交触发...")
+                try:
+                    page.locator('#renew-modal button[type="submit"].btn-primary').first.click(timeout=8000)
+                except Exception:
+                    pass
+                resubmitted = True
                 time.sleep(4)
 
-        # 兜底: 模态框仍未关(ALTCHA 未通过), 手动解题后再提交一次
+        # 兜底: 仍未关 -> 手动点复选框解题(注意 CSRF 误判已修复)
         if page.locator('#renew-modal.show').count() > 0:
-            log("ALTCHA 尚未通过, 尝试手动解题...")
+            log(f"ALTCHA 仍未完成(状态: {_altcha_state(page)}), 尝试手动解题...")
             if solve_altcha(page, timeout=30):
                 try:
                     page.locator('#renew-modal button[type="submit"].btn-primary').first.click(timeout=8000)
@@ -606,6 +644,13 @@ def renew_server(page):
             log(f"续期成功! 到期 {old_expiry} -> {new_expiry}")
             return True, new_expiry
         log(f"未检测到明确结果(最后提示: {last_msg[:100]})")
+        if console_msgs:
+            log(f"ALTCHA 控制台输出: {console_msgs[-5:]}")
+        if failed_reqs:
+            log(f"ALTCHA 相关请求失败: {failed_reqs[-5:]}")
+            log("⚠️ altcha.katabump.fr 不可达 -> 当前代理节点可能屏蔽了验证服务器, 换节点重试")
+        if page.locator('#renew-modal.show').count() > 0:
+            log(f"模态框仍打开, ALTCHA 状态: {_altcha_state(page)}")
         page.screenshot(path="renew_no_result.png")
         return False, new_expiry
     except Exception as e:
