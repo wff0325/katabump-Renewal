@@ -1,641 +1,675 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+KataBump 服务器自动续期脚本(修复版)
+原项目: https://github.com/wff0325/katabump-Renewal (存在结果误判/确认不可靠问题)
 
-import os
-import time
-import subprocess
-import requests
-from seleniumbase import SB
+修复点:
+  1. 续期结果以「Expiry 日期变化」为准，不再读页面第一条 alert
+     (原版会把 Change type 区块的常驻警告当成续期结果)
+  2. 模态框内为 ALTCHA 验证(auto="onsubmit" 自动解题)，点击 submit 后
+     等待表单 POST 完成并校验到期时间，验证未过时自动重点
+  3. 登录 Turnstile 用 patchright + 真实浏览器点击，过 CF 盾
 
-# 从环境变量获取账号密码和 TG 配置
-EMAIL        = os.environ.get("KATABUMP_EMAIL") or ""    # 登录邮箱
-PASSWORD     = os.environ.get("KATABUMP_PASSWORD") or "" # 账号密码
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可选)
+用法:
+    本地:  .env 写入 KATABUMP_EMAIL/KATABUMP_PASSWORD 后 python app.py
+    Actions: 仓库 Secrets 配 KATABUMP_EMAIL / KATABUMP_PASSWORD / NODE_LINK / TG_*
+"""
 
-BASE_URL = "https://dashboard.katabump.com"  # 网站链接
+import os, re, sys, time, random
 
-#  Telegram 推送模块
-def send_tg_message(status_icon, status_text, time_left=""):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
+def _load_local_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
         return
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and v and not os.environ.get(k):
+                    os.environ[k] = v
+    except Exception:
+        pass
 
-    # 获取北京时间 (UTC+8)
+_load_local_env()
+
+# ==================== CONFIG ====================
+EMAIL        = os.environ.get('KATABUMP_EMAIL') or os.environ.get('EMAIL') or ""
+PASSWORD     = os.environ.get('KATABUMP_PASSWORD') or os.environ.get('PASSWORD') or ""
+SERVER_URL   = os.environ.get('SERVER_URL') or ""      # 可选: 固定服务器页, 留空自动发现
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
+IS_PROXY     = os.environ.get('IS_PROXY', 'false').lower() == 'true'
+PROXY_SERVER = os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081"
+BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
+SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
+
+REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+
+BASE_URL = "https://dashboard.katabump.com"
+LOGIN_URL = f"{BASE_URL}/auth/login"
+
+try:
+    from patchright.sync_api import sync_playwright
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import sync_playwright
+    USING_PATCHRIGHT = False
+
+import requests
+
+# ==================== 常量 ====================
+CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
+SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required',
+                        'checking your browser', 'one more step')
+# 服务器页 "Expiry\n2026-10-20"
+EXPIRY_RE = re.compile(r'Expiry\s*\n?\s*(\d{4}-\d{2}-\d{2})', re.IGNORECASE)
+# 未到续期时间提示中的可续期日期, 如 "as of 19 October"
+RENEW_DATE_RE = re.compile(r'as of ([^\(\n]+)', re.IGNORECASE)
+
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+def get_current_ip():
+    try:
+        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=15)
+        if resp.status_code == 200:
+            return resp.text.strip()
+    except Exception as e:
+        log(f"获取出口IP失败: {e}")
+    return "获取失败"
+
+def send_telegram_notification(status, old_expiry, new_expiry, current_ip="未知"):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("Telegram 未配置，跳过通知")
+        return
     local_time = time.gmtime(time.time() + 8 * 3600)
-    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-
-    # 邮箱脱敏：保留用户名前2位和后2位，中间用****代替
+    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
+        masked = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****'
-
+        masked = EMAIL[:2] + '****'
     text = (
-        f"🇫🇷 katabump 续期通知\n\n"
-        f"{status_icon} {status_text}\n"
-        f"👤 续期账户: {masked_email}\n"
-        f"⏱️ 续期时间: {current_time_str}"
+        f"KataBump 续期通知\n\n"
+        f"{status}\n"
+        f"账号: {masked}\n"
+        f"续期前到期: {old_expiry}\n"
+        f"续期后到期: {new_expiry}\n"
+        f"IP: {current_ip}\n"
+        f"时间: {now}"
     )
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text
-    }
-    
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            print("📩 Telegram 通知发送成功！")
+        resp = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                             json={"chat_id": TG_CHAT_ID, "text": text},
+                             timeout=10, proxies=REQUESTS_PROXIES)
+        if resp.status_code == 200:
+            log("Telegram 通知发送成功")
         else:
-            print(f"⚠️ Telegram 通知发送失败: {r.text}")
+            log(f"Telegram 通知失败: {resp.text}")
     except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
+        log(f"Telegram 通知异常: {e}")
 
-#  页面注入脚本
-_EXPAND_JS = """
-(function() {
-    var ts = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!ts) return 'no-turnstile';
-    var el = ts;
-    for (var i = 0; i < 20; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        var s = window.getComputedStyle(el);
-        if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
-            el.style.overflow = 'visible';
-        el.style.minWidth = 'max-content';
-    }
-    document.querySelectorAll('iframe').forEach(function(f){
-        if (f.src && f.src.includes('challenges.cloudflare.com')) {
-            f.style.width = '300px'; f.style.height = '65px';
-            f.style.minWidth = '300px';
-            f.style.visibility = 'visible'; f.style.opacity = '1';
-        }
-    });
-    return 'done';
-})()
-"""
 
-_EXISTS_JS = """
-(function(){
-    return document.querySelector('input[name="cf-turnstile-response"]') !== null;
-})()
-"""
-
-_SOLVED_JS = """
-(function(){
-    var i = document.querySelector('input[name="cf-turnstile-response"]');
-    return !!(i && i.value && i.value.length > 20);
-})()
-"""
-
-_WININFO_JS = """
-(function(){
-    return {
-        sx: window.screenX || 0,
-        sy: window.screenY || 0,
-        oh: window.outerHeight,
-        ih: window.innerHeight
-    };
-})()
-"""
-
-# ===== 自动续期相关 =====
-
-# 在模态框内查找 iframe 并展开，返回点击坐标
-_ALTCHA_EXPAND_JS = """
-(function() {
-    var modal = document.querySelector('div.modal.show') || document;
-    var iframes = modal.querySelectorAll('iframe');
-    for (var i = 0; i < iframes.length; i++) {
-        var r = iframes[i].getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-            iframes[i].style.width  = '300px';
-            iframes[i].style.height = '150px';
-            iframes[i].style.minWidth  = '300px';
-            iframes[i].style.minHeight = '150px';
-            iframes[i].style.visibility = 'visible';
-            iframes[i].style.opacity = '1';
-            var el = iframes[i];
-            for (var j = 0; j < 10; j++) {
-                el = el.parentElement;
-                if (!el) break;
-                el.style.overflow = 'visible';
-            }
-            var r2 = iframes[i].getBoundingClientRect();
-            return { cx: Math.round(r2.x + 30), cy: Math.round(r2.y + r2.height / 2) };
-        }
-    }
-    return null;
-})()
-"""
-
-# 检测 ALTCHA 是否已验证通过
-_ALTCHA_SOLVED_JS = """
-(function(){
-    var modal = document.querySelector('div.modal.show') || document;
-    // hidden input 有值
-    var inputs = modal.querySelectorAll('input[type="hidden"]');
-    for (var i = 0; i < inputs.length; i++) {
-        var n = (inputs[i].name || '').toLowerCase();
-        if ((n.includes('altcha') || n.includes('captcha')) &&
-            inputs[i].value && inputs[i].value.length > 20) return true;
-    }
-    // checkbox 变为 disabled
-    var cbs = modal.querySelectorAll('input[type="checkbox"]');
-    for (var j = 0; j < cbs.length; j++) {
-        if (cbs[j].disabled) return true;
-    }
-    // widget data-state 属性
-    var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
-    if (w) return true;
-    return false;
-})()
-"""
-
-#  底层输入工具
-def js_fill_input(sb, selector: str, text: str):
-    safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
-    sb.execute_script(f"""
-    (function(){{
-        var el = document.querySelector('{selector}');
-        if (!el) return;
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-        if (nativeInputValueSetter) {{
-            nativeInputValueSetter.call(el, "{safe_text}");
-        }} else {{
-            el.value = "{safe_text}";
-        }}
-        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    }})()
-    """)
-
-def _activate_window():
-    for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
-        try:
-            r = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", cls], capture_output=True, text=True, timeout=3)
-            wids = [w for w in r.stdout.strip().split("\n") if w.strip()]
-            if wids:
-                subprocess.run(["xdotool", "windowactivate", "--sync", wids[0]], timeout=3, stderr=subprocess.DEVNULL)
-                time.sleep(0.2)
-                return
-        except Exception:
-            pass
+# ==================== Cloudflare 过盾 ====================
+def _has_interstitial_iframe(page):
     try:
-        subprocess.run(["xdotool", "getactivewindow", "windowactivate"], timeout=3, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-# def _xdotool_click(x: int, y: int):
-#     _activate_window()
-#     try:
-#         subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
-#         time.sleep(0.15)
-#         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-#     except Exception:
-#         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
-
-#  人机验证处理（使用 SeleniumBase 内置 uc_gui_click_captcha）
-def handle_turnstile(sb) -> bool:
-    print("🔍 处理 Cloudflare Turnstile 验证...")
-    time.sleep(2)
-
-    # 检查是否已静默通过
-    if sb.execute_script(_SOLVED_JS):
-        print("✅ 已静默通过")
-        return True
-
-    # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
-    for _ in range(3):
-        try: sb.execute_script(_EXPAND_JS)
-        except Exception: pass
-        time.sleep(0.5)
-
-    # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
-    # 该方法自动完成：检测验证码类型 → 定位 iframe → 计算坐标 → PyAutoGUI 平滑点击
-    for attempt in range(6):
-        if sb.execute_script(_SOLVED_JS):
-            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
-            return True
-
-        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
-
-        # 等待验证结果（最多 8 秒）
-        for _ in range(16):
-            time.sleep(0.5)
-            if sb.execute_script(_SOLVED_JS):
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+        for h in page.query_selector_all(CF_IFRAME_SELECTOR):
+            if '/turnstile/' not in (h.get_attribute('src') or ''):
                 return True
-
-        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
-
-    print("  ❌ Turnstile 6 次均失败")
-    return False
-
-#  账户登录
-def login(sb) -> bool:
-    print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
-    sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
-    time.sleep(8)
-
-    # 先等待 Cloudflare 验证通过（最多等 30 秒）
-    print("⏳ 等待 Cloudflare 验证通过...")
-    cf_passed = False
-    for i in range(30):
-        page_src = sb.get_page_source() or ""
-        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
-            cf_passed = True
-            print(f"✅ Cloudflare 验证已通过（{i+1}s）")
-            break
-        time.sleep(1)
-    if not cf_passed:
-        print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
-
-    try:
-        sb.wait_for_element('input[type="email"]', timeout=15)
-    except Exception:
-        # 尝试大写选择器作为后备
-        try:
-            sb.wait_for_element('input[type="Email"]', timeout=5)
-        except Exception:
-            print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
-            sb.save_screenshot("login_load_fail.png")
-            return False
-
-    print("🍪 关闭可能的 Cookie 弹窗...")
-    try:
-        for btn in sb.find_elements("button"):
-            if "Accept" in (btn.text or ""):
-                btn.click()
-                time.sleep(0.5)
-                break
     except Exception:
         pass
-
-    print(f"📧 填写邮箱...")
-    js_fill_input(sb, 'input[type="email"]', EMAIL)
-    time.sleep(1)
-    
-    print("🔑 填写密码...")
-    js_fill_input(sb, 'input[type="password"]', PASSWORD)
-    time.sleep(3)
-
-    # 等待 Turnstile 验证框出现（最多 10 秒）
-    print("⏳ 等待 Turnstile 验证框出现...")
-    ts_found = False
-    for i in range(10):
-        if sb.execute_script(_EXISTS_JS):
-            ts_found = True
-            print(f"✅ 检测到 Turnstile（{i+1}s）")
-            break
-        time.sleep(1)
-
-    if ts_found:
-        if not handle_turnstile(sb):
-            print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot("login_turnstile_fail.png")
-            return False
-    else:
-        print("ℹ️ 未检测到 Turnstile")
-
-    print("🖱️ 敲击回车提交表单...")
-    sb.press_keys('input[name="password"]', '\n')
-
-    print("⏳ 等待登录跳转...")
-    for _ in range(12):
-        time.sleep(1)
-        cur_url = sb.get_current_url().split('?')[0].lower()
-        page_title = sb.get_title() or ""
-        if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-            break
-
-    cur_url = sb.get_current_url().split('?')[0].lower()
-    page_title = sb.get_title() or ""
-    if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
-        print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
-        return True
-        
-    print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-    sb.save_screenshot("login_failed.png")
     return False
 
-# ===== 自动续期流程 =====
-
-def _read_alert(sb):
-    """读取页面第一个 Bootstrap alert 的文本，找不到返回空串"""
+def _is_security_check_page(page):
     try:
-        el = sb.find_element("div.alert", timeout=4)
-        return (el.text or "").strip()
+        title = (page.title() or '').lower()
+        if any(h in title for h in SECURITY_TITLE_HINTS):
+            return True
     except Exception:
-        return ""
+        return True
+    try:
+        return page.evaluate("""() => {
+            const t = document.body ? document.body.innerText.slice(0,5000).toLowerCase() : '';
+            return t.includes('verify you are human') || t.includes('checking your browser')
+                || t.includes('security verification');
+        }""")
+    except Exception:
+        return True
 
+def _find_visible_cf_frames(page):
+    result = []
+    try:
+        for h in page.query_selector_all(CF_IFRAME_SELECTOR):
+            try:
+                box = h.bounding_box()
+                if box and box['width'] > 10 and box['height'] > 10:
+                    result.append(h)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return result
 
-def _goto_server_detail(sb) -> bool:
-    """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
-    print("\n🖥️  正在进入服务器续期页...")
-    time.sleep(5)
-
-    # 检查页面顶部是否已有"还无法续期"全局提示
-    alert_text = _read_alert(sb)
-    if alert_text and "can't renew" in alert_text.lower():
-        print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
-        return False
-
-    # 多种选择器尝试查找 See 链接
-    selectors = [
-        'a[href*="/servers/edit?id="]',
-        'td a[href*="/servers/edit"]',
-        'table a[href*="/servers/edit"]',
-        'table td a',
-    ]
-
-    see_link = None
-    for sel in selectors:
+def _click_cf_checkbox(page, frame_el=None):
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
         try:
-            see_link = sb.find_element(sel, timeout=8)
-            print(f"✅ 通过选择器找到链接: {sel}")
-            break
+            frame.locator('input[type="checkbox"]').first.click(timeout=2500)
+            return True
         except Exception:
             continue
-
-    # 选择器全部失败，尝试通过文本内容查找
-    if see_link is None:
-        print("⚠️ 选择器未命中，尝试文本匹配...")
-        try:
-            for a in sb.find_elements("a"):
-                if (a.text or "").strip().lower() == "see":
-                    see_link = a
-                    print("✅ 通过文本 'See' 找到链接")
-                    break
-        except Exception:
-            pass
-
-    if see_link is None:
-        # 打印调试信息帮助排查
-        cur_url = sb.get_current_url()
-        title = sb.get_title() or ""
-        print(f"❌ 未找到 'See' 链接")
-        print(f"当前 URL: {cur_url}")
-        print(f"页面标题: {title}")
-        try:
-            links = sb.find_elements("a")
-            print(f"     页面共 {len(links)} 个链接:")
-            for a in links[:20]:
-                href = a.get_attribute("href") or ""
-                txt  = (a.text or "").strip()[:30]
-                if href:
-                    print(f"       - [{txt}] -> {href}")
-        except Exception:
-            pass
-        sb.save_screenshot("servers_page_fail.png")
+    if frame_el is None:
         return False
-
-    print("🖱️  点击 'See' 进入服务器详情页...")
-    see_link.click()
-    time.sleep(5)
-    print(f"📄 当前页面: {sb.get_current_url()}")
-    return True
-
-
-def _open_renew_modal(sb) -> bool:
-    """滚动到 Renew 按钮并点击，打开模态框"""
-    print("\n🔄 查找 Renew 按钮...")
     try:
-        renew_btn = sb.find_element('button[data-bs-target="#renew-modal"]', timeout=10)
-    except Exception:
-        try:
-            renew_btn = sb.find_element('button.btn.btn-outline-primary', timeout=5)
-        except Exception:
-            print("  ❌ 未找到 Renew 按钮")
+        frame_el.scroll_into_view_if_needed(timeout=3000)
+        box = frame_el.bounding_box()
+        if not box:
             return False
-
-    sb.execute_script("""
-        (function(){
-            var btn = document.querySelector('button[data-bs-target="#renew-modal"]')
-                     || document.querySelector('button.btn.btn-outline-primary');
-            if (btn) btn.scrollIntoView({behavior:'smooth',block:'center'});
-        })()
-    """)
-    time.sleep(0.8)
-    renew_btn.click()
-    print("🖱️ 已点击 Renew 按钮，等待确认框...")
-    time.sleep(3)
-
-    try:
-        sb.find_element('div.modal.show', timeout=5)
-        print("✅ Renew 模态框已弹出")
+        x = box['x'] + random.uniform(18, 34)
+        y = box['y'] + box['height'] / 2 + random.uniform(-4, 4)
+        page.mouse.move(x - random.uniform(30, 60), y + random.uniform(-8, 8))
+        time.sleep(random.uniform(0.15, 0.4))
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.05, 0.2))
+        page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.1))
+        page.mouse.up()
         return True
     except Exception:
-        print("⚠️ 模态框未弹出")
         return False
 
-
-# def _solve_altcha(sb) -> bool:
-#     """处理 ALTCHA 人机验证"""
-#     print("\n🔐 处理 ALTCHA 人机验证...")
-#     time.sleep(2)
-#
-#     # 先检查是否已自动通过
-#     if sb.execute_script(_ALTCHA_SOLVED_JS):
-#         print("✅ ALTCHA 已自动通过")
-#         return True
-#
-#     # 展开模态框内 iframe 并获取坐标
-#     coords = None
-#     try:
-#         coords = sb.execute_script(_ALTCHA_EXPAND_JS)
-#     except Exception:
-#         pass
-#
-#     if coords:
-#         print(f"  📍 找到模态框内 iframe 坐标: ({coords['cx']}, {coords['cy']})")
-#
-#     # 最多尝试 3 轮
-#     for attempt in range(3):
-#         if sb.execute_script(_ALTCHA_SOLVED_JS):
-#             print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
-#             return True
-#
-#         # 策略 1: xdotool 物理点击 iframe 坐标
-#         if coords:
-#             try:
-#                 wi = sb.execute_script(_WININFO_JS)
-#             except Exception:
-#                 wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-#             bar = wi["oh"] - wi["ih"]
-#             ax  = coords["cx"] + wi["sx"]
-#             ay  = coords["cy"] + wi["sy"] + bar
-#             print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
-#             _xdotool_click(ax, ay)
-#
-#         # 策略 2: SeleniumBase 原生点击模态框内 iframe 元素
-#         try:
-#             iframes = sb.find_elements('div.modal.show iframe')
-#             for iframe in iframes:
-#                 try:
-#                     iframe.click()
-#                     print("🖱️  SeleniumBase 点击模态框 iframe")
-#                 except Exception:
-#                     pass
-#         except Exception:
-#             pass
-#
-#         # 策略 3: JS 遍历模态框内所有可点击元素
-#         sb.execute_script("""
-#             (function(){
-#                 var modal = document.querySelector('div.modal.show');
-#                 if (!modal) return;
-#                 // 点击 iframe
-#                 var iframes = modal.querySelectorAll('iframe');
-#                 for (var i = 0; i < iframes.length; i++) {
-#                     iframes[i].click();
-#                     iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-#                 }
-#                 // 点击含 checkbox 的 label
-#                 var labels = modal.querySelectorAll('label');
-#                 for (var j = 0; j < labels.length; j++) {
-#                     var txt = (labels[j].textContent || '').toLowerCase();
-#                     if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
-#                         labels[j].click();
-#                 }
-#                 // 点击 checkbox
-#                 var cbs = modal.querySelectorAll('input[type="checkbox"]');
-#                 for (var k = 0; k < cbs.length; k++) {
-#                     if (!cbs[k].disabled) {
-#                         cbs[k].click();
-#                         cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-#                     }
-#                 }
-#             })()
-#         """)
-#
-#         # 等待验证结果
-#         for _ in range(6):
-#             time.sleep(1)
-#             if sb.execute_script(_ALTCHA_SOLVED_JS):
-#                 print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
-#                 return True
-#
-#         print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
-#         # 重新获取坐标（iframe 可能已重新渲染）
-#         try:
-#             new_coords = sb.execute_script(_ALTCHA_EXPAND_JS)
-#             if new_coords:
-#                 coords = new_coords
-#         except Exception:
-#             pass
-#
-#     print("  ❌ ALTCHA 3 轮均失败")
-#     return False
-
-
-def _submit_renew(sb):
-    """点击模态框内的 Renew 提交按钮"""
-    print("🖱️  点击模态框中的 Renew 按钮...")
+def _get_turnstile_token(page):
     try:
-        submit = sb.find_element('div.modal-footer button.btn.btn-primary', timeout=10)
-        submit.click()
+        return page.evaluate("""() => {
+            if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                let t = null;
+                try { t = window.turnstile.getResponse(); } catch(e) {}
+                if (t && t.length > 30) return t;
+                for (let i = 0; i < 5; i++) {
+                    try { t = window.turnstile.getResponse(String(i)); } catch(e) { t = null; }
+                    if (t && t.length > 30) return t;
+                }
+            }
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (inp && inp.value && inp.value.length > 30) return inp.value;
+            return null;
+        }""")
     except Exception:
-        sb.execute_script("""
-            (function(){
-                var m = document.querySelector('button.btn.btn-primary');
-                if (!m) return;
-                var bs = m.querySelectorAll('button');
-                for (var i = 0; i < bs.length; i++)
-                    if (/renew/i.test(bs[i].textContent)) bs[i].click();
-            })()
-        """)
-    time.sleep(8)
+        return None
+
+def handle_cloudflare(page, timeout=None):
+    if timeout is None:
+        timeout = SECURITY_TIMEOUT
+    def active():
+        return _has_interstitial_iframe(page) or _is_security_check_page(page)
+    if not active():
+        return True
+    log("检测到 Cloudflare 安全验证...")
+    time.sleep(3)
+    start = time.time()
+    last_click = 0
+    clear = 0
+    while time.time() - start < timeout:
+        if not active():
+            clear += 1
+            if clear >= 2:
+                return True
+            time.sleep(1)
+            continue
+        clear = 0
+        if time.time() - last_click > 6:
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                log("点击 Turnstile 验证...")
+                if _click_cf_checkbox(page, frames[-1]):
+                    last_click = time.time()
+                    time.sleep(random.uniform(2, 4))
+                    continue
+        time.sleep(1)
+    log("CF 验证超时")
+    return False
+
+def solve_turnstile(page, timeout=90):
+    """登录页 Turnstile: 点击复选框直到 token 生成"""
+    if _get_turnstile_token(page):
+        return True
+    frames = _find_visible_cf_frames(page)
+    if not frames:
+        time.sleep(2)
+        if _get_turnstile_token(page) or not _find_visible_cf_frames(page):
+            return True
+    log("处理 Turnstile 人机验证...")
+    start = time.time()
+    last_click = 0
+    clicks = 0
+    while time.time() - start < timeout:
+        if _get_turnstile_token(page):
+            log("Turnstile 验证通过")
+            return True
+        frames = _find_visible_cf_frames(page)
+        if not frames:
+            break
+        if time.time() - last_click > 5:
+            log(f"点击 Turnstile 复选框 (第 {clicks + 1} 次)...")
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(2, 4))
+                continue
+        time.sleep(1)
+    return bool(_get_turnstile_token(page))
+
+# ==================== ALTCHA 验证(续期模态框) ====================
+def _altcha_state(page):
+    """返回模态框内 altcha-widget 的 data-state"""
+    try:
+        return page.evaluate("""() => {
+            const w = document.querySelector('#renew-modal altcha-widget, .modal.show altcha-widget');
+            return w ? (w.getAttribute('data-state') || '') : null;
+        }""")
+    except Exception:
+        return None
+
+def _altcha_verified(page):
+    try:
+        return page.evaluate("""() => {
+            const w = document.querySelector('.modal.show altcha-widget, #renew-modal altcha-widget');
+            if (w && (w.getAttribute('data-state') || '') === 'verified') return true;
+            const inp = document.querySelector('.modal.show input[type="hidden"]');
+            return !!(inp && inp.value && inp.value.length > 20);
+        }""")
+    except Exception:
+        return False
+
+def solve_altcha(page, timeout=60):
+    """等待 ALTCHA 自动解题(auto="onsubmit" 点击提交后自动验证)；未过则手动点复选框"""
+    start = time.time()
+    if _altcha_verified(page):
+        return True
+    # auto="onsubmit": 提交时自动解题, 先等
+    while time.time() - start < 8:
+        if _altcha_verified(page):
+            log("ALTCHA 自动验证通过")
+            return True
+        time.sleep(1)
+    # 手动点复选框
+    last_click = 0
+    clicks = 0
+    while time.time() - start < timeout:
+        if _altcha_verified(page):
+            log("ALTCHA 验证通过")
+            return True
+        if time.time() - last_click > 4:
+            log(f"点击 ALTCHA 复选框 (第 {clicks + 1} 次)...")
+            try:
+                cb = page.locator('.modal.show altcha-widget input[type="checkbox"]').first
+                cb.click(timeout=3000)
+            except Exception:
+                try:
+                    page.locator('.modal.show altcha-widget label.altcha-label').first.click(timeout=3000)
+                except Exception:
+                    pass
+            clicks += 1
+            last_click = time.time()
+            time.sleep(3)
+            continue
+        time.sleep(1)
+    return _altcha_verified(page)
 
 
-def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
-    print("\n📋 检查续期结果...")
-    alert_text = _read_alert(sb)
-    if not alert_text:
-        time.sleep(3)
-        alert_text = _read_alert(sb)
+# ==================== 浏览器 ====================
+def _detect_channel():
+    if BROWSER_CHANNEL:
+        return BROWSER_CHANNEL
+    if sys.platform == 'win32':
+        for ch, paths in {
+            'msedge': [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"],
+            'chrome': [r"C:\Program Files\Google\Chrome\Application\chrome.exe"],
+        }.items():
+            if any(os.path.exists(p) for p in paths):
+                return ch
+        return None
+    import shutil
+    if shutil.which("google-chrome") or shutil.which("google-chrome-stable"):
+        return "chrome"
+    if shutil.which("microsoft-edge"):
+        return "msedge"
+    return "chrome"
 
-    if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
-    else:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
-
-
-def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
-    print("\n" + "#" * 25)
-    print("  开始自动续期流程")
-    print("#" * 25)
-
-    if not _goto_server_detail(sb):
-        return
-
-    if not _open_renew_modal(sb):
-        return
-
-    # altcha_ok = _solve_altcha(sb)
-    # if not altcha_ok:
-    #     print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
-
-    _submit_renew(sb)
-    _check_renew_result(sb)
-
-
-#  脚本执行入口 (可选代理)
-def main():
-    print("#" * 25)
-    print("   katabump 自动登录续期")
-    print("#" * 25)
-
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-    sb_kwargs = {"uc": True, "headless": False}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
-    else:
-        print("🌐 未使用代理，直连访问")
-    
-    print("🚀 启动浏览器...")
-    with SB(**sb_kwargs) as sb:
-        # print("✅ 浏览器已启动")
+def open_browser(p):
+    proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
+    channel = _detect_channel()
+    if USING_PATCHRIGHT and channel:
         try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"📍  当前出口IP: {sb.get_text('body')}")
+            browser = p.chromium.launch(channel=channel, headless=False,
+                                        args=['--disable-infobars'], proxy=proxy_arg)
+            ctx = browser.new_context(viewport={'width': 1440, 'height': 900}, proxy=proxy_arg)
+            log(f"启动反检测浏览器 (patchright + {channel})")
+            return browser, ctx.new_page()
+        except Exception as e:
+            log(f"patchright 启动失败: {e}")
+    browser = p.chromium.launch(headless=False,
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'])
+    ctx = browser.new_context(viewport={'width': 1440, 'height': 900},
+                              proxy=proxy_arg)
+    page = ctx.new_page()
+    page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    return browser, page
+
+# ==================== 登录 ====================
+def login(page):
+    if not EMAIL or not PASSWORD:
+        log("缺少登录凭证 (KATABUMP_EMAIL/KATABUMP_PASSWORD)")
+        return False
+    try:
+        log("打开登录页...")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        time.sleep(3)
+
+        # cookie 弹窗
+        for txt in ("Accept", "accept", "Got it", "OK", "I agree"):
+            try:
+                btn = page.locator(f'button:has-text("{txt}")').first
+                if btn.count() > 0:
+                    btn.click(timeout=3000)
+                    log(f"已关闭 Cookie 弹窗 ({txt})")
+                    time.sleep(0.5)
+                    break
+            except Exception:
+                continue
+
+        log("填写账号密码...")
+        email_sel = page.locator('input[type="email"], input[name="email"]').first
+        pwd_sel = page.locator('input[type="password"], input[name="password"]').first
+        email_sel.wait_for(state="visible", timeout=30000)
+        email_sel.fill(EMAIL, timeout=10000)
+        pwd_sel.fill(PASSWORD, timeout=10000)
+        time.sleep(0.5)
+
+        solve_turnstile(page, timeout=90)
+
+        log("提交登录...")
+        submitted = False
+        for sel in ('button[type="submit"]', 'button:has-text("Sign in")',
+                    'button:has-text("Login")', 'button:has-text("Log in")'):
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0:
+                    btn.click(timeout=5000)
+                    submitted = True
+                    break
+            except Exception:
+                continue
+        if not submitted:
+            pwd_sel.press("Enter")
+        time.sleep(5)
+        handle_cloudflare(page)
+
+        nav_start = time.time()
+        navigated = False
+        while time.time() - nav_start < 120:
+            try:
+                if '/dashboard' in page.url and '/auth/login' not in page.url:
+                    navigated = True
+                    break
+                if _is_security_check_page(page) or _has_interstitial_iframe(page):
+                    handle_cloudflare(page, timeout=60)
+            except Exception:
+                pass
+            time.sleep(1)
+        if not navigated:
+            log(f"登录失败，仍停留在: {page.url}")
+            page.screenshot(path="login_fail.png")
+            return False
+        log(f"登录成功: {page.url}")
+        return True
+    except Exception as e:
+        log(f"登录异常: {e}")
+        try:
+            page.screenshot(path="login_fail.png")
         except Exception:
             pass
+        return False
 
-        if login(sb):
-            renew_server(sb)   # 登录成功后自动续期
-        else:
-            print("\n❌ 登录失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
+# ==================== 服务器页 ====================
+def get_server_url(page):
+    try:
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        time.sleep(3)
+        links = page.evaluate(
+            "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
+        )
+        for href in links:
+            if href and '/servers/edit' in href:
+                url = href if href.startswith('http') else BASE_URL + href
+                log(f"发现服务器: {url}")
+                return url
+        log("未找到服务器链接")
+    except Exception as e:
+        log(f"获取服务器链接异常: {e}")
+    return None
+
+def get_expiry(page):
+    """读取服务器页 Expiry 日期 (YYYY-MM-DD)"""
+    try:
+        text = page.locator("body").inner_text()
+        m = EXPIRY_RE.search(text)
+        if m:
+            return m.group(1).strip()
+        # 兜底: Service information 区块
+        m2 = re.search(r'Expiry\s*[:\n]\s*(\d{4}-\d{2}-\d{2})', text)
+        if m2:
+            return m2.group(1)
+    except Exception as e:
+        log(f"读取到期时间异常: {e}")
+    return "未知"
+
+def _visible_alerts(page):
+    """页面【可见】的 alert 列表。
+    页面存在隐藏的常驻警告(Change type)和FAQ文本, 必须只读可见提示, 否则误判。"""
+    try:
+        return page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('.alert, [role="alert"]').forEach(a => {
+                const r = a.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    out.push({cls: a.className || '', text: (a.innerText||'').trim()});
+                }
+            });
+            return out;
+        }""")
+    except Exception:
+        return []
+
+# ==================== 续期 ====================
+def renew_server(page):
+    """打开 Renew 模态框 -> ALTCHA -> 提交 -> 以 Expiry 变化判定结果。
+    返回 (True成功/False失败/'NOT_TIME', 新Expiry)"""
+    try:
+        old_expiry = get_expiry(page)
+        log(f"续期前到期: {old_expiry}")
+
+        log("点击 Renew 打开模态框...")
+        # 注意: 不能用 button:has-text("Renew") 兜底 —— 大小写不敏感会先匹配到
+        # "Easy renewal" 手风琴按钮(点它只展开FAQ)。必须用 data-bs-target 精确定位。
+        renew_btn = page.locator('button[data-bs-target="#renew-modal"]')
+        if renew_btn.count() == 0:
+            renew_btn = page.locator('button.btn.btn-outline-primary:has-text("Renew")')
+        if renew_btn.count() == 0:
+            log("未找到 Renew 按钮")
+            page.screenshot(path="renew_no_button.png")
+            return False, old_expiry
+        renew_btn.first.scroll_into_view_if_needed()
+        renew_btn.first.click(timeout=10000)
+        time.sleep(3)
+
+        if page.locator('#renew-modal.show').count() == 0:
+            log("模态框未弹出")
+            page.screenshot(path="renew_modal_failed.png")
+            return False, old_expiry
+        log("Renew 模态框已弹出")
+
+        # 模态框内的 Renew 提交按钮(带 data-altcha-wired)
+        submit = page.locator('#renew-modal button[type="submit"].btn-primary').first
+        log("点击模态框 Renew 提交(ALTCHA 将自动解题)...")
+        submit.click(timeout=10000)
+
+        # ALTCHA 自动解题(auto="onsubmit"): 验证通过后表单才真正提交。
+        # 点击提交 -> 等 ALTCHA 验证 -> 模态框关闭(表单提交/跳转)为止;
+        # 若验证后模态框仍在, 需要再点一次提交。
+        altcha_deadline = time.time() + 45
+        while time.time() < altcha_deadline:
+            time.sleep(2)
+            if page.locator('#renew-modal.show').count() == 0:
+                break
+            if _altcha_verified(page):
+                log("ALTCHA 已验证, 再次点击提交...")
+                try:
+                    page.locator('#renew-modal button[type="submit"].btn-primary').first.click(timeout=8000)
+                except Exception:
+                    pass
+                time.sleep(4)
+
+        # 兜底: 模态框仍未关(ALTCHA 未通过), 手动解题后再提交一次
+        if page.locator('#renew-modal.show').count() > 0:
+            log("ALTCHA 尚未通过, 尝试手动解题...")
+            if solve_altcha(page, timeout=30):
+                try:
+                    page.locator('#renew-modal button[type="submit"].btn-primary').first.click(timeout=8000)
+                    log("已再次提交")
+                    time.sleep(5)
+                except Exception:
+                    pass
+
+        # 等待结果: 以可见 alert + Expiry 变化双重判定
+        # (只读可见 alert! 页面有隐藏的常驻警告和FAQ文本, 全文扫描会误判)
+        log("等待续期结果...")
+        start = time.time()
+        last_msg = ""
+        new_expiry = old_expiry
+        while time.time() - start < 60:
+            handle_cloudflare(page, timeout=10)
+            time.sleep(2)
+            for a in _visible_alerts(page):
+                low = a['text'].lower()
+                last_msg = a['text']
+                if any(k in low for k in ("can't renew", "cannot renew", "as of",
+                                          "already renewed", "not yet", "too early")):
+                    m = RENEW_DATE_RE.search(a['text'])
+                    if m:
+                        log(f"未到续期时间(可续期日期: {m.group(1).strip()})")
+                    else:
+                        log(f"未到续期时间: {last_msg[:120]}")
+                    page.screenshot(path="renew_not_yet.png")
+                    return "NOT_TIME", old_expiry
+                if any(k in low for k in ("renewed", "success", "extended")):
+                    # 提示成功, 确认到期时间变化
+                    for _ in range(10):
+                        time.sleep(3)
+                        new_expiry = get_expiry(page)
+                        if new_expiry != old_expiry and new_expiry != "未知":
+                            log(f"续期成功! 到期 {old_expiry} -> {new_expiry}")
+                            return True, new_expiry
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        time.sleep(3)
+                    except Exception:
+                        pass
+                    new_expiry = get_expiry(page)
+                    if new_expiry != old_expiry and new_expiry != "未知":
+                        log(f"续期成功! 到期 {old_expiry} -> {new_expiry}")
+                        return True, new_expiry
+                    log("提示成功但到期时间未变化")
+                    page.screenshot(path="renew_no_change.png")
+                    return False, new_expiry
+            # 无 alert 但到期时间已变
+            try:
+                if '/api-client/renew' not in page.url:
+                    new_expiry = get_expiry(page)
+                    if new_expiry != old_expiry and new_expiry != "未知":
+                        log(f"续期成功! 到期 {old_expiry} -> {new_expiry}")
+                        return True, new_expiry
+            except Exception:
+                pass
+
+        new_expiry = get_expiry(page)
+        if new_expiry != old_expiry and new_expiry != "未知":
+            log(f"续期成功! 到期 {old_expiry} -> {new_expiry}")
+            return True, new_expiry
+        log(f"未检测到明确结果(最后提示: {last_msg[:100]})")
+        page.screenshot(path="renew_no_result.png")
+        return False, new_expiry
+    except Exception as e:
+        log(f"续期异常: {e}")
+        try:
+            page.screenshot(path="renew_error.png")
+        except Exception:
+            pass
+        return False, "未知"
+
+# ==================== 主流程 ====================
+def main():
+    log(f"凭证检测: EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
+    if not EMAIL or not PASSWORD:
+        log("缺少登录凭证, 退出")
+        sys.exit(1)
+
+    server_url = SERVER_URL
+    with sync_playwright() as p:
+        browser = None
+        try:
+            if IS_PROXY:
+                log(f"代理已启用: {PROXY_SERVER}")
+            current_ip = get_current_ip()
+            log(f"当前出口IP: {current_ip}")
+
+            browser, page = open_browser(p)
+            page.set_default_timeout(15000)
+
+            if not login(page):
+                sys.exit(1)
+
+            if not server_url:
+                server_url = get_server_url(page)
+                if not server_url:
+                    log("无法获取服务器地址, 退出")
+                    sys.exit(1)
+
+            page.goto(server_url, wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(3)
+            old_expiry = get_expiry(page)
+            log(f"当前到期: {old_expiry}")
+
+            result, new_expiry = renew_server(page)
+
+            if result == "NOT_TIME":
+                status = "未到续期时间"
+            elif result is True:
+                status = "续期成功"
+            else:
+                status = "续期失败"
+
+            send_telegram_notification(status, old_expiry, new_expiry, current_ip)
+            sys.exit(0 if result is True or result == "NOT_TIME" else 1)
+        except Exception as e:
+            log(f"运行出错: {e}")
+            sys.exit(1)
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     main()
