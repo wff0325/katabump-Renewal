@@ -85,34 +85,82 @@ def get_current_ip():
         log(f"获取出口IP失败: {e}")
     return "获取失败"
 
-def send_telegram_notification(status, old_expiry, new_expiry, current_ip="未知"):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("Telegram 未配置，跳过通知")
-        return
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+def _fmt_date_cn(s):
+    """YYYY-MM-DD -> 2026年11月23日 (周一)"""
+    if not s or s == "未知":
+        return "未知"
+    try:
+        dt = time.strptime(s, "%Y-%m-%d")
+        return f"{dt.tm_year}年{dt.tm_mon:02d}月{dt.tm_mday:02d}日 (周{'一二三四五六日'[dt.tm_wday]})"
+    except Exception:
+        return s
+
+def _days_left(s):
+    if not s or s == "未知":
+        return None
+    try:
+        return int(round((time.mktime(time.strptime(s, "%Y-%m-%d")) - time.time()) / 86400))
+    except Exception:
+        return None
+
+def build_notification_text(status, old_expiry, new_expiry, current_ip="未知"):
+    """构造 Telegram 通知文本(HTML)。独立成函数便于预览/测试。"""
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600))
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         masked = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
     else:
-        masked = EMAIL[:2] + '****'
-    text = (
-        f"KataBump 续期通知\n\n"
-        f"{status}\n"
-        f"账号: {masked}\n"
-        f"续期前到期: {old_expiry}\n"
-        f"续期后到期: {new_expiry}\n"
-        f"IP: {current_ip}\n"
-        f"时间: {now}"
-    )
+        masked = (EMAIL[:2] + '****') if EMAIL else "未配置"
+
+    if status.startswith("续期成功"):
+        icon, title = "✅", "续期成功"
+    elif "未到" in status:
+        icon, title = "🕐", "未到续期时间"
+    elif "失败" in status:
+        icon, title = "❌", "续期失败"
+    else:
+        icon, title = "ℹ️", status
+
+    left = _days_left(new_expiry)
+    left_txt = f"（剩 {left} 天）" if left is not None else ""
+
+    lines = [
+        f"<b>{icon} KataBump 续期通知</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"<b>状态</b>　　{title}",
+        f"<b>账号</b>　　<code>{masked}</code>",
+        "",
+        "<b>📅 到期时间</b>",
+        f"　续期前　{_fmt_date_cn(old_expiry)}",
+        f"　续期后　<b>{_fmt_date_cn(new_expiry)}</b>{left_txt}",
+        "",
+        "<b>🌐 运行环境</b>",
+        f"　出口 IP　<code>{current_ip}</code>",
+        f"　时间　　{now} (UTC+8)",
+    ]
+    return "\n".join(lines)
+
+def send_telegram_notification(status, old_expiry, new_expiry, current_ip="未知"):
+    """发送排版精美的 Telegram 通知(HTML)"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("Telegram 未配置，跳过通知")
+        return
+    text = build_notification_text(status, old_expiry, new_expiry, current_ip)
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                             json={"chat_id": TG_CHAT_ID, "text": text},
+        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text,
+                                        "parse_mode": "HTML",
+                                        "disable_web_page_preview": True},
                              timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
             log("Telegram 通知发送成功")
         else:
-            log(f"Telegram 通知失败: {resp.text}")
+            log(f"Telegram HTML 通知失败({resp.status_code})，回退纯文本: {resp.text[:120]}")
+            plain = re.sub(r'<[^>]+>', '', text)
+            r2 = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": plain},
+                               timeout=10, proxies=REQUESTS_PROXIES)
+            log("Telegram 通知发送成功(纯文本)" if r2.status_code == 200
+                else f"Telegram 通知失败: {r2.text[:200]}")
     except Exception as e:
         log(f"Telegram 通知异常: {e}")
 
@@ -237,15 +285,38 @@ def handle_cloudflare(page, timeout=None):
     log("CF 验证超时")
     return False
 
+def _captcha_pending(page):
+    """页面存在 Turnstile 占位节点但没有 token -> 验证尚未完成(可能是组件未渲染)"""
+    try:
+        return page.evaluate("""() => {
+            const hasWidget = !!document.querySelector(
+                '[id*="cf-chl-widget"], .cf-turnstile, #cf-turnstile, input[name="cf-turnstile-response"]');
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            const hasToken = !!(inp && inp.value && inp.value.length > 30);
+            return hasWidget && !hasToken;
+        }""")
+    except Exception:
+        return False
+
 def solve_turnstile(page, timeout=90):
     """登录页 Turnstile: 点击复选框直到 token 生成"""
     if _get_turnstile_token(page):
         return True
     frames = _find_visible_cf_frames(page)
     if not frames:
-        time.sleep(2)
-        if _get_turnstile_token(page) or not _find_visible_cf_frames(page):
-            return True
+        # 组件可能仍在加载: 最多再等 ~15 秒
+        for _ in range(10):
+            time.sleep(1.5)
+            if _get_turnstile_token(page):
+                return True
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                break
+        if not frames:
+            if _captcha_pending(page):
+                log("⚠️ Turnstile 占位存在但未渲染（CF 资源可能被网络拦截），不提交表单")
+                return False
+            return True  # 页面确实无 Turnstile
     log("处理 Turnstile 人机验证...")
     start = time.time()
     last_click = 0
